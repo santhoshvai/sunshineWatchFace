@@ -20,6 +20,7 @@ import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.net.Uri;
+import android.os.AsyncTask;
 import android.os.Build;
 import android.os.Bundle;
 import android.preference.PreferenceManager;
@@ -36,6 +37,14 @@ import com.example.android.sunshine.app.R;
 import com.example.android.sunshine.app.Utility;
 import com.example.android.sunshine.app.data.WeatherContract;
 import com.example.android.sunshine.app.muzei.WeatherMuzeiSource;
+import com.google.android.gms.common.ConnectionResult;
+import com.google.android.gms.common.api.GoogleApiClient;
+import com.google.android.gms.common.api.ResultCallback;
+import com.google.android.gms.wearable.DataApi;
+import com.google.android.gms.wearable.DataEventBuffer;
+import com.google.android.gms.wearable.PutDataMapRequest;
+import com.google.android.gms.wearable.PutDataRequest;
+import com.google.android.gms.wearable.Wearable;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -52,13 +61,14 @@ import java.net.URL;
 import java.util.Vector;
 import java.util.concurrent.ExecutionException;
 
-public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
+public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter implements GoogleApiClient.ConnectionCallbacks,
+        GoogleApiClient.OnConnectionFailedListener, DataApi.DataListener {
     public final String LOG_TAG = SunshineSyncAdapter.class.getSimpleName();
     public static final String ACTION_DATA_UPDATED =
             "com.example.android.sunshine.app.ACTION_DATA_UPDATED";
     // Interval at which to sync with the weather, in seconds.
     // 60 seconds (1 minute) * 180 = 3 hours
-    public static final int SYNC_INTERVAL = 60 * 180;
+    public static final int SYNC_INTERVAL = 10;//60 * 180;
     public static final int SYNC_FLEXTIME = SYNC_INTERVAL/3;
     private static final long DAY_IN_MILLIS = 1000 * 60 * 60 * 24;
     private static final int WEATHER_NOTIFICATION_ID = 3004;
@@ -87,8 +97,28 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
     public static final int LOCATION_STATUS_UNKNOWN = 3;
     public static final int LOCATION_STATUS_INVALID = 4;
 
+    // BEGIN vars for wearable
+    private GoogleApiClient mGoogleApiClient;
+    private static final String WEARABLECONNECTTAG = "WEAR-CONNECT-TAG";
+    private boolean mResolvingError = false;
+    /**
+     * Request code for launching the Intent to resolve Google Play services errors.
+     */
+    private static final int REQUEST_RESOLVE_ERROR = 1000;
+    private static final String HIGH_TEMP_KEY = "hightemp";
+    private static final String LOW_TEMP_KEY = "lowtemp";
+    private static final String IMAGE_TEMP_KEY = "imagetemp";
+
+    private static final String CURRENT_TEMP_PATH = "/currenttemp";
+
+    private static String sHighTemp = "";
+    private static String sLowTemp = "";
+    private static int sWeatherId = 0;
+    // END vars for wearable
+
     public SunshineSyncAdapter(Context context, boolean autoInitialize) {
         super(context, autoInitialize);
+        Log.d(LOG_TAG, "constructor sync");
     }
 
     @Override
@@ -107,6 +137,16 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
         String format = "json";
         String units = "metric";
         int numDays = 14;
+
+        // BEGIN wear build
+        Log.d(LOG_TAG, "mGoogleApiClient created");
+        mGoogleApiClient = new GoogleApiClient.Builder(getContext())
+                .addApi(Wearable.API)
+                .addConnectionCallbacks(this)
+                .addOnConnectionFailedListener(this)
+                .build();
+        mGoogleApiClient.connect();
+        // END wear build
 
         try {
             // Construct the URL for the OpenWeatherMap query
@@ -330,6 +370,25 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
                 weatherValues.put(WeatherContract.WeatherEntry.COLUMN_WEATHER_ID, weatherId);
 
                 cVVector.add(weatherValues);
+                //BEGIN send to wear
+                if(i == 0) { // for first row only
+                    sHighTemp = Utility.formatTemperature(getContext(), high);
+                    sLowTemp = Utility.formatTemperature(getContext(), low);
+                    sWeatherId = weatherId;
+                    // start to send dataitems to wear on background
+                    new AsyncTask<Void, Void, Void>() {
+                        @Override
+                        protected Void doInBackground( final Void ... params ) {
+                            dataItemGenerate();
+                            return null;
+                        }
+                        @Override
+                        protected void onPostExecute( final Void result ) {
+                            // continue what you are doing...
+                        }
+                    }.execute();
+                }
+                //END send to wear
             }
 
             int inserted = 0;
@@ -342,7 +401,7 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
                 // delete old data so we don't build up an endless history
                 getContext().getContentResolver().delete(WeatherContract.WeatherEntry.CONTENT_URI,
                         WeatherContract.WeatherEntry.COLUMN_DATE + " <= ?",
-                        new String[] {Long.toString(dayTime.setJulianDay(julianStartDay-1))});
+                        new String[]{Long.toString(dayTime.setJulianDay(julianStartDay - 1))});
 
                 updateWidgets();
                 updateMuzei();
@@ -621,7 +680,9 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
     }
 
     public static void initializeSyncAdapter(Context context) {
-        getSyncAccount(context);
+        Log.d(WEARABLECONNECTTAG, "syncadapter initialised");
+        //getSyncAccount(context);
+        syncImmediately(context);
     }
 
     /**
@@ -636,4 +697,62 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
         spe.putInt(c.getString(R.string.pref_location_status_key), locationStatus);
         spe.commit();
     }
+
+    @Override //ConnectionCallbacks
+    public void onConnected(Bundle connectionHint) {
+        Log.d(WEARABLECONNECTTAG, "Google API Client was connected");
+        mResolvingError = false;
+        Wearable.DataApi.addListener(mGoogleApiClient, this);
+    }
+
+    @Override //ConnectionCallbacks
+    public void onConnectionSuspended(int cause) {
+        Log.d(WEARABLECONNECTTAG, "Connection to Google API client was suspended");
+        mResolvingError = false;
+    }
+
+    @Override //OnConnectionFailedListener
+    public void onConnectionFailed(ConnectionResult result) {
+        Log.e(WEARABLECONNECTTAG, "Connection to Google API client has failed");
+        mResolvingError = true;
+        Wearable.DataApi.removeListener(mGoogleApiClient, this);
+        mGoogleApiClient.connect();
+    }
+
+    @Override //DataListener
+    public void onDataChanged(DataEventBuffer dataEvents) {
+        Log.d(WEARABLECONNECTTAG, "onDataChanged: " + dataEvents);
+        /* We are not going to listen from wear, nothing needed here */
+    }
+
+
+
+    private void dataItemGenerate() {
+        PutDataMapRequest putDataMapRequest = PutDataMapRequest.create(CURRENT_TEMP_PATH);
+        putDataMapRequest.getDataMap().putString(HIGH_TEMP_KEY, sHighTemp);
+        putDataMapRequest.getDataMap().putString(LOW_TEMP_KEY, sLowTemp);
+        putDataMapRequest.getDataMap().putAsset(IMAGE_TEMP_KEY,
+                Utility.toAsset(getContext(),sWeatherId));
+        PutDataRequest request = putDataMapRequest.asPutDataRequest();
+        // DataItems will be delayed no longer than 30 minutes, subject to a connected peer, but are expected to arrive much sooner.
+        request.setUrgent();
+
+        Log.d(WEARABLECONNECTTAG, "Generating DataItem: " + request);
+
+        if (!mGoogleApiClient.isConnected()) {
+            return;
+        }
+        Wearable.DataApi.putDataItem(mGoogleApiClient, request)
+                .setResultCallback(new ResultCallback<DataApi.DataItemResult>() {
+                    // Asynchronous call back method
+                    @Override
+                    public void onResult(DataApi.DataItemResult dataItemResult) {
+                        if (!dataItemResult.getStatus().isSuccess()) {
+                            Log.e(WEARABLECONNECTTAG, "ERROR: failed to putDataItem, status code: "
+                                    + dataItemResult.getStatus().getStatusCode());
+                        }
+                    }
+                });
+    }
+
 }
