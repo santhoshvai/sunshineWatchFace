@@ -42,6 +42,10 @@ import com.google.android.gms.common.api.GoogleApiClient;
 import com.google.android.gms.common.api.ResultCallback;
 import com.google.android.gms.wearable.DataApi;
 import com.google.android.gms.wearable.DataEventBuffer;
+import com.google.android.gms.wearable.MessageApi;
+import com.google.android.gms.wearable.MessageEvent;
+import com.google.android.gms.wearable.Node;
+import com.google.android.gms.wearable.NodeApi;
 import com.google.android.gms.wearable.PutDataMapRequest;
 import com.google.android.gms.wearable.PutDataRequest;
 import com.google.android.gms.wearable.Wearable;
@@ -58,17 +62,19 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.Vector;
 import java.util.concurrent.ExecutionException;
 
 public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter implements GoogleApiClient.ConnectionCallbacks,
-        GoogleApiClient.OnConnectionFailedListener, DataApi.DataListener {
+        GoogleApiClient.OnConnectionFailedListener, DataApi.DataListener, MessageApi.MessageListener {
     public final String LOG_TAG = SunshineSyncAdapter.class.getSimpleName();
     public static final String ACTION_DATA_UPDATED =
             "com.example.android.sunshine.app.ACTION_DATA_UPDATED";
     // Interval at which to sync with the weather, in seconds.
     // 60 seconds (1 minute) * 180 = 3 hours
-    public static final int SYNC_INTERVAL = 10;//60 * 180;
+    public static final int SYNC_INTERVAL = 60 * 180;
     public static final int SYNC_FLEXTIME = SYNC_INTERVAL/3;
     private static final long DAY_IN_MILLIS = 1000 * 60 * 60 * 24;
     private static final int WEATHER_NOTIFICATION_ID = 3004;
@@ -108,8 +114,11 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter implements 
     private static final String HIGH_TEMP_KEY = "hightemp";
     private static final String LOW_TEMP_KEY = "lowtemp";
     private static final String IMAGE_TEMP_KEY = "imagetemp";
+    private static final String TIME_STAMP_KEY = "timestamp";
 
     private static final String CURRENT_TEMP_PATH = "/currenttemp";
+    private static final String TIME_STAMP_PATH = "/timestamp";
+    private static final String START_WEATHER_SYNC_PATH = "/pleasesync";
 
     private static String sHighTemp = "";
     private static String sLowTemp = "";
@@ -379,7 +388,8 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter implements 
                     new AsyncTask<Void, Void, Void>() {
                         @Override
                         protected Void doInBackground( final Void ... params ) {
-                            dataItemGenerate();
+                            onStartWearableSync();
+                            dataItemGenerate(CURRENT_TEMP_PATH);
                             return null;
                         }
                         @Override
@@ -681,7 +691,7 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter implements 
 
     public static void initializeSyncAdapter(Context context) {
         Log.d(WEARABLECONNECTTAG, "syncadapter initialised");
-        //getSyncAccount(context);
+//        getSyncAccount(context);
         syncImmediately(context);
     }
 
@@ -703,6 +713,7 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter implements 
         Log.d(WEARABLECONNECTTAG, "Google API Client was connected");
         mResolvingError = false;
         Wearable.DataApi.addListener(mGoogleApiClient, this);
+        Wearable.MessageApi.addListener(mGoogleApiClient, this);
     }
 
     @Override //ConnectionCallbacks
@@ -716,6 +727,7 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter implements 
         Log.e(WEARABLECONNECTTAG, "Connection to Google API client has failed");
         mResolvingError = true;
         Wearable.DataApi.removeListener(mGoogleApiClient, this);
+        Wearable.MessageApi.removeListener(mGoogleApiClient, this);
         mGoogleApiClient.connect();
     }
 
@@ -727,16 +739,21 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter implements 
 
 
 
-    private void dataItemGenerate() {
-        PutDataMapRequest putDataMapRequest = PutDataMapRequest.create(CURRENT_TEMP_PATH);
+    private void dataItemGenerate(String path) {
+        PutDataMapRequest putDataMapRequest = PutDataMapRequest.create(path);
         putDataMapRequest.getDataMap().putString(HIGH_TEMP_KEY, sHighTemp);
+        if(path.equals(TIME_STAMP_PATH)) {
+            putDataMapRequest.getDataMap().putString(TIME_STAMP_KEY,
+                    Long.toString(System.currentTimeMillis()));
+        }
         putDataMapRequest.getDataMap().putString(LOW_TEMP_KEY, sLowTemp);
         putDataMapRequest.getDataMap().putAsset(IMAGE_TEMP_KEY,
-                Utility.toAsset(getContext(),sWeatherId));
+                Utility.toAsset(getContext(), sWeatherId));
+        Log.d(WEARABLECONNECTTAG, path + " dataMap to be put as request:  "
+                + putDataMapRequest.getDataMap().toString());
         PutDataRequest request = putDataMapRequest.asPutDataRequest();
         // DataItems will be delayed no longer than 30 minutes, subject to a connected peer, but are expected to arrive much sooner.
         request.setUrgent();
-
         Log.d(WEARABLECONNECTTAG, "Generating DataItem: " + request);
 
         if (!mGoogleApiClient.isConnected()) {
@@ -753,6 +770,66 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter implements 
                         }
                     }
                 });
+    }
+
+    // BEGIN methods to send RPC
+    private Collection<String> getNodes() {
+        HashSet<String> results = new HashSet<>();
+        NodeApi.GetConnectedNodesResult nodes =
+                Wearable.NodeApi.getConnectedNodes(mGoogleApiClient).await();
+
+        for (Node node : nodes.getNodes()) {
+            results.add(node.getId());
+        }
+
+        return results;
+    }
+
+    private void sendStartWeatherMessage(String node) {
+        // Sends byte[] data to the specified node.
+        Wearable.MessageApi.sendMessage(
+                mGoogleApiClient, node, START_WEATHER_SYNC_PATH, new byte[0]).setResultCallback(
+                new ResultCallback<MessageApi.SendMessageResult>() {
+                    @Override
+                    public void onResult(MessageApi.SendMessageResult sendMessageResult) {
+                        if (!sendMessageResult.getStatus().isSuccess()) {
+                            Log.e(WEARABLECONNECTTAG, "Failed to send message with status code: "
+                                    + sendMessageResult.getStatus().getStatusCode());
+                        }
+                    }
+                }
+        );
+    }
+
+    private class StartWearableWeatherTask extends AsyncTask<Void, Void, Void> {
+
+        @Override
+        protected Void doInBackground(Void... args) {
+            Collection<String> nodes = getNodes();
+            for (String node : nodes) {
+                sendStartWeatherMessage(node);
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Sends an RPC to start a syncing weather on the wearable.
+     */
+    public void onStartWearableSync() {
+        Log.d(WEARABLECONNECTTAG, "Generating RPC");
+
+        // Trigger an AsyncTask that will query for a list of connected nodes and send a
+        // "start-activity" message to each connected node.
+        new StartWearableWeatherTask().execute();
+    }
+
+    // alert bitmap is null, send a changed data item somehow
+    @Override
+    public void onMessageReceived(MessageEvent event) {
+        Log.d(WEARABLECONNECTTAG, "onMessageReceived: " + event);
+        Log.d(WEARABLECONNECTTAG, "onMessageReceived: " + "dataItemWithTimeStamp generation");
+        dataItemGenerate(TIME_STAMP_PATH);
     }
 
 }

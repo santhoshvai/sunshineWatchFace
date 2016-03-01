@@ -11,3 +11,7 @@ Complete these steps to update Sunshine to use an API key:
 2. Add the line below to your `~/.gradle/gradle.properties` file (create the file if it does not exist already):
    `MyOpenWeatherMapApiKey=”YOUR_API_KEY”`
 
+
+## Screenshots
+
+![sunshine-watchface](http://i.imgur.com/r8xLBWT.gif)
